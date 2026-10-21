@@ -423,9 +423,9 @@ void MlDriftConversionNumericalTest::RunTest(
   }
 }
 
-TEST_F(MlDriftConversionNumericalTest, DISABLED_QuantizeOp) {
+TEST_F(MlDriftConversionNumericalTest, QuantizeThenDequantizeOp) {
   TensorMLD input({.type = Type::kFP32, .shape = {1, 2, 2, 1}});
-  TensorMLD output = Quantize(input, Type::kI8, {0.5}, {0});
+  TensorMLD output = Dequantize(Quantize(input, Type::kI8, {0.5}, {0}));
   RunTest(output, {{input, std::vector<float>{0.6f, 0.8f, 1.2f, 1.6f}}},
           {0.5f, 1.0f, 1.0f, 1.5f});
 }
@@ -439,6 +439,20 @@ TEST_F(MlDriftConversionNumericalTest, DequantizeOp) {
   TensorMLD output = Dequantize(quant_input);
   RunTest(output, {{quant_input, std::vector<int8_t>{1, 2, -1, -2}}},
           {0.25f, 0.5f, -0.25f, -0.5f});
+}
+
+TEST_F(MlDriftConversionNumericalTest, DequantizeConstantOp) {
+  // [[1, 3, 5], [-7, 9, 11]] quantized along their first dimension.
+  TensorMLD weights(
+      {.type = Type::kI8,
+       .shape = {2, 3},
+       .buffer = OwningCpuBuffer::Copy<Type::kI8>({1, 3, 5, -7, 9, 11}),
+       .quantization = std::make_shared<PerChannelAffineQuantization>(
+           std::vector<float>{0.5f, 2.0f}, std::vector<int64_t>{1, -1})});
+  TensorMLD input({.type = Type::kFP32, .shape = {2, 3}});
+  TensorMLD output = Add(Dequantize(weights), input);
+  RunTest(output, {{input, std::vector<float>{1, 1, 1, 1, 1, 1}}},
+          {1, 2, 3, -11, 21, 25});
 }
 
 TEST_F(MlDriftConversionNumericalTest, GetTensorHandleWithMlDriftBuffer) {
