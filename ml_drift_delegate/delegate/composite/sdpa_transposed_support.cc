@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstdint>
 
+#include "ml_drift/common/data_type.h"  // from @ml_drift
 #include "ml_drift/common/gpu_info.h"  // from @ml_drift
 #include "ml_drift/common/shape.h"  // from @ml_drift
 
@@ -174,6 +175,58 @@ uint64_t DecomposedSdpaScoreBytes(const ::ml_drift::BHWC& q_shape,
          kHalfBytes;
 }
 
+namespace {
+
+// The score budget of the decomposed prefill graph on backends that move
+// larger prefill to the work-group Flash kernel: `max_score_bytes` and, on
+// OpenCL, at most the maximum buffer allocation of the device.
+uint64_t WorkGroupFlashPrefillScoreBudget(const ::ml_drift::GpuInfo& gpu_info,
+                                          uint64_t max_score_bytes) {
+  uint64_t budget = max_score_bytes;
+  if (gpu_info.IsApiOpenCl() && gpu_info.opencl_info.max_allocation_size > 0) {
+    budget = std::min(budget, gpu_info.opencl_info.max_allocation_size);
+  }
+  return budget;
+}
+
+}  // namespace
+
+uint64_t DecomposedSdpaScoreChunkBudget(const ::ml_drift::GpuInfo& gpu_info,
+                                        uint64_t max_score_bytes,
+                                        uint64_t max_chunk_bytes) {
+  if (SupportsFusedSdpaKernels(gpu_info) &&
+      !SupportsWaveMatrixPrefill(gpu_info)) {
+    return std::max(max_chunk_bytes, WorkGroupFlashPrefillScoreBudget(
+                                         gpu_info, max_score_bytes));
+  }
+  return max_chunk_bytes;
+}
+
+int DecomposedSdpaBytesPerScore(::ml_drift::DataType data_type,
+                                bool from_cache_update) {
+  const int bytes = ::ml_drift::SizeOf(data_type);
+  return from_cache_update ? bytes : 2 * bytes;
+}
+
+int NumDecomposedSdpaScoreChunks(const ::ml_drift::BHWC& q_shape,
+                                 const ::ml_drift::BHWC& k_shape,
+                                 uint64_t max_chunk_bytes,
+                                 int bytes_per_score) {
+  if (k_shape.h <= 0 || q_shape.h < k_shape.h || q_shape.h % k_shape.h != 0) {
+    return 1;
+  }
+  const int gqa_ratio = q_shape.h / k_shape.h;
+  const uint64_t score_bytes = static_cast<uint64_t>(q_shape.b) * q_shape.h *
+                               q_shape.w * k_shape.w * bytes_per_score;
+  for (int chunks = 1; chunks < gqa_ratio; ++chunks) {
+    // The score bytes are a multiple of `gqa_ratio`, so the division is exact.
+    if (gqa_ratio % chunks == 0 && score_bytes / chunks <= max_chunk_bytes) {
+      return chunks;
+    }
+  }
+  return gqa_ratio;
+}
+
 bool UsesWorkGroupFlashPrefill(const ::ml_drift::GpuInfo& gpu_info,
                                const ::ml_drift::BHWC& q_shape,
                                const ::ml_drift::BHWC& k_shape,
@@ -181,11 +234,8 @@ bool UsesWorkGroupFlashPrefill(const ::ml_drift::GpuInfo& gpu_info,
   if (SupportsWaveMatrixPrefill(gpu_info) || q_shape.w <= 1) {
     return false;
   }
-  uint64_t budget = max_score_bytes;
-  if (gpu_info.IsApiOpenCl() && gpu_info.opencl_info.max_allocation_size > 0) {
-    budget = std::min(budget, gpu_info.opencl_info.max_allocation_size);
-  }
-  return DecomposedSdpaScoreBytes(q_shape, k_shape) > budget;
+  return DecomposedSdpaScoreBytes(q_shape, k_shape) >
+         WorkGroupFlashPrefillScoreBudget(gpu_info, max_score_bytes);
 }
 
 bool UsesFlashDecodeForShape(const ::ml_drift::GpuInfo& gpu_info,
