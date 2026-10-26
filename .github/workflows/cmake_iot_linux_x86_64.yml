@@ -1,0 +1,187 @@
+name: "cmake-iot-linux"
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "0 10 * * *"  # Run at 2am PST (10am UTC) every day to refresh the cache.
+  workflow_dispatch:
+    inputs:
+      REFRESH_CACHE:
+        description: 'Refresh cache to remove unused files'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check Changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run_build: ${{ steps.check.outputs.run_build }}
+    steps:
+      - if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.0
+        id: filter
+        with:
+          predicate-quantifier: 'some-with-excludes'
+          filters: |
+            src:
+              - '**'
+              - '!*.md'
+              - '!**/*.md'
+              - '!docs/**'
+              - '!g3doc/**'
+              - '!site/**'
+              - '!LICENSE'
+              - '!litert_quantizer/**'
+      - name: Determine if build should run
+        id: check
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SRC_CHANGED: ${{ steps.filter.outputs.src }}
+        run: |
+          if [[ "${EVENT_NAME}" != "pull_request" || "${SRC_CHANGED}" == "true" ]]; then
+            echo "run_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  presubmit:
+    name: "Presubmit-IoT-Linux"
+    needs: check
+    if: needs.check.outputs.run_build == 'true'
+    runs-on: linux-x86-n4-16
+    container:
+      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build@sha256:d6b429665f5269698f88ccd00bcb8a6eb685332c302f08f29fe0738cd6a6610c
+    permissions:
+      actions: write
+      contents: write
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 6
+      GH_TOKEN: ${{ github.token }}
+      LINUX_AARCH64_ESDK: /opt/toolchains/qcom-esdk-gcc11.2
+      REFRESH_CACHE: ${{ github.event_name == 'schedule' ||
+                         (github.event_name == 'workflow_dispatch' && inputs.REFRESH_CACHE) }}
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git-lfs \
+            python3-pip \
+            gawk \
+            unzip \
+            wget \
+            curl \
+            locales \
+            diffstat \
+            cpio \
+            chrpath \
+            file
+          sudo locale-gen en_US.UTF-8
+          git lfs install
+          pip3 install cmake==3.28.3
+          cmake --version
+
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          lfs: true
+
+      - name: Prepare toolchain directory
+        run: |
+          sudo mkdir -p /opt/toolchains
+          sudo chown "$(id -u):$(id -g)" /opt/toolchains
+          sudo chmod 755 /opt/toolchains
+
+      - name: Set up cache keys
+        id: cache-keys
+        env:
+          WORKFLOW_NAME: ${{ github.workflow }}
+          FLATC_HASH: ${{ hashFiles('litert/CMakeLists.txt') }}
+          ESDK_HASH: ${{ hashFiles('ci/build_iot_linux_with_docker.sh', 'ci/litert-iot-linux.Dockerfile') }}
+        run: |
+          FLATC_RESTORE_KEY="${WORKFLOW_NAME}-flatc"
+          FLATC_CACHE_KEY="${FLATC_RESTORE_KEY}-${FLATC_HASH}"
+          ESDK_CACHE_KEY="${WORKFLOW_NAME}-esdk-v1-${ESDK_HASH}"
+          echo "FLATC_RESTORE_KEY=${FLATC_RESTORE_KEY}" >> "$GITHUB_OUTPUT"
+          echo "FLATC_CACHE_KEY=${FLATC_CACHE_KEY}" >> "$GITHUB_OUTPUT"
+          echo "ESDK_CACHE_KEY=${ESDK_CACHE_KEY}" >> "$GITHUB_OUTPUT"
+
+      - name: Clean build outputs and remove caches if cache is being refreshed
+        if: env.REFRESH_CACHE == 'true'
+        continue-on-error: true
+        env:
+          FLATC_CACHE_KEY: ${{ steps.cache-keys.outputs.FLATC_CACHE_KEY }}
+          ESDK_CACHE_KEY: ${{ steps.cache-keys.outputs.ESDK_CACHE_KEY }}
+        run: |
+          rm -rf host_flatc_build "${LINUX_AARCH64_ESDK}"
+          gh cache delete "${FLATC_CACHE_KEY}" || true
+          gh cache delete "${ESDK_CACHE_KEY}" || true
+
+      - name: Restore and save host flatc cache
+        id: cmake-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.2.0
+        with:
+          path: host_flatc_build
+          key: ${{ steps.cache-keys.outputs.FLATC_CACHE_KEY }}
+          restore-keys: ${{ env.REFRESH_CACHE != 'true' && format('{0}-', steps.cache-keys.outputs.FLATC_RESTORE_KEY) || '' }}
+
+      - name: Restore and save Qualcomm OpenEmbedded eSDK cache
+        id: esdk-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.2.0
+        with:
+          path: /opt/toolchains/qcom-esdk-gcc11.2
+          key: ${{ steps.cache-keys.outputs.ESDK_CACHE_KEY }}
+
+      - name: Install Qualcomm OpenEmbedded eSDK
+        if: steps.esdk-cache.outputs.cache-hit != 'true'
+        run: SETUP_ESDK_ONLY=true ./ci/build_iot_linux_with_docker.sh
+
+      - name: Build Linux IoT artifacts
+        run: RUN_DIRECTLY=true JOBS=6 OUTPUT_DIR=/tmp/litert_binaries ./ci/build_iot_linux_with_docker.sh
+
+  # A PR is accepted only if this check concludes "success" ("skipped" doesn't
+  # count). So this job always runs, and passes if Presubmit-IoT-Linux
+  # passed or was skipped because the PR has no relevant changes. This check is
+  # required by name, so keep the name unique across workflows.
+  gate:
+    name: "Presubmit-IoT-Linux-Gate"
+    needs: [check, presubmit]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Check results
+        shell: bash
+        env:
+          CHECK_RESULT: ${{ needs.check.result }}
+          RUN_BUILD: ${{ needs.check.outputs.run_build }}
+          BUILD_RESULT: ${{ needs.presubmit.result }}
+        run: |
+          echo "check=${CHECK_RESULT} run_build=${RUN_BUILD} build=${BUILD_RESULT}"
+          if [[ "${CHECK_RESULT}" == "success" ]]; then
+            if [[ "${BUILD_RESULT}" == "success" ]]; then
+              exit 0
+            fi
+            if [[ "${BUILD_RESULT}" == "skipped" && "${RUN_BUILD}" == "false" ]]; then
+              exit 0
+            fi
+          fi
+          exit 1
