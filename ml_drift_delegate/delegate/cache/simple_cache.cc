@@ -15,9 +15,16 @@
 #include "ml_drift_delegate/delegate/cache/simple_cache.h"
 
 #include <fcntl.h>  // IWYU pragma: keep b/332641196
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>  // NOLINT for path manipulation.
 #include <string>
@@ -59,6 +66,17 @@ absl::Status WriteToFd(const ::ml_drift::FileDescriptor& fd,
   return absl::OkStatus();
 }
 
+std::string MakeTempCacheFilePath(absl::string_view target_path) {
+  static std::atomic<uint64_t> counter{0};
+#if defined(_WIN32)
+  const int pid = _getpid();
+#else
+  const int pid = getpid();
+#endif
+  return absl::StrCat(target_path, ".tmp.", pid, ".",
+                      counter.fetch_add(1, std::memory_order_relaxed));
+}
+
 }  // namespace
 
 SimpleCache::SimpleCache(::ml_drift::FileDescriptor fd) : fd_(std::move(fd)) {}
@@ -92,11 +110,30 @@ absl::Status SimpleCache::Store(absl::Span<const uint8_t> data) {
     return WriteToFd(fd_, data);
   }
 
+  if (cache_file_path_.empty()) {
+    return absl::InternalError("Failed to open cache file for writing.");
+  }
+  const std::string temp_path = MakeTempCacheFilePath(cache_file_path_);
   ::ml_drift::FileDescriptor fd = ::ml_drift::FileDescriptor::Open(
-      cache_file_path_.c_str(),
+      temp_path.c_str(),
       O_WRONLY | O_CREAT | O_TRUNC,  // NOLINT: b/332641196
       0644);
-  return WriteToFd(fd, data);
+  absl::Status write_status = WriteToFd(fd, data);
+  fd.Close();
+  if (!write_status.ok()) {
+    std::remove(temp_path.c_str());
+    return write_status;
+  }
+#if defined(_WIN32)
+  std::remove(cache_file_path_.c_str());
+#endif
+  if (std::rename(temp_path.c_str(), cache_file_path_.c_str()) != 0) {
+    const int err = errno;
+    std::remove(temp_path.c_str());
+    return absl::InternalError(absl::StrCat(
+        "Failed to atomically rename cache file: ", strerror(err)));
+  }
+  return absl::OkStatus();
 }
 
 std::string SimpleCache::ToString() const {

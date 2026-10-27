@@ -603,5 +603,56 @@ TEST(CacheBuilderTest, FlatBufferDoesNotGrowUnnecessarilyAcrossSteps) {
   }
 }
 
+TEST(CacheBuilderTest, RebuildDoesNotTruncateExistingMappedFile) {
+  const std::string payload1(8192, 'A');
+  const std::string payload2(256, 'B');
+  const uint64_t unique_model_identifier = 4321;
+  const std::string cache_path =
+      absl::StrCat(testing::TempDir(), "/atomic_rebuild_cache");
+
+  {
+    ml_drift::CacheBuilder builder1;
+    ASSERT_OK(builder1.Start(cache_path, unique_model_identifier));
+    ASSERT_OK(builder1.StartBuildStep(unique_model_identifier));
+    ml_drift::TensorDescriptor tensor_desc(
+        ml_drift::DataType::kFloat32, ml_drift::TensorStorageType::kBuffer,
+        ml_drift::Layout::kLinear);
+    ml_drift::BufferLocation loc;
+    ASSERT_OK(builder1.Append(/*global_tensor_id=*/1,
+                              /*is_quantization_param_tensor=*/false,
+                              tensor_desc, payload1.data(), payload1.size(),
+                              loc));
+    ASSERT_OK(builder1.StopBuildStep());
+  }
+
+  // Keep the first cache file memory-mapped while a second builder rebuilds and
+  // overwrites the same path with a much smaller file.
+  MMapHandle existing_reader;
+  ASSERT_OK(existing_reader.Map(cache_path.c_str()));
+  const std::vector<uint8_t> snapshot_before(
+      existing_reader.data(), existing_reader.data() + existing_reader.size());
+
+  {
+    ml_drift::CacheBuilder builder2;
+    ASSERT_OK(builder2.Start(cache_path, unique_model_identifier));
+    ASSERT_OK(builder2.StartBuildStep(unique_model_identifier));
+    ml_drift::TensorDescriptor tensor_desc(
+        ml_drift::DataType::kFloat32, ml_drift::TensorStorageType::kBuffer,
+        ml_drift::Layout::kLinear);
+    ml_drift::BufferLocation loc;
+    ASSERT_OK(builder2.Append(/*global_tensor_id=*/1,
+                              /*is_quantization_param_tensor=*/false,
+                              tensor_desc, payload2.data(), payload2.size(),
+                              loc));
+    ASSERT_OK(builder2.StopBuildStep());
+  }
+
+  // Verify the existing reader's mapped pages were not truncated or mutated in
+  // place.
+  const std::vector<uint8_t> snapshot_after(
+      existing_reader.data(), existing_reader.data() + existing_reader.size());
+  EXPECT_EQ(snapshot_before, snapshot_after);
+}
+
 }  // namespace
 }  // namespace mldrift

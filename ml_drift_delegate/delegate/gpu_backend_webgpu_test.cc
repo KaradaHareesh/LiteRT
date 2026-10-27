@@ -177,6 +177,12 @@ TEST_F(GpuBackendWebGpuTest,
     EXPECT_THAT(ctx_2->GetSpatialTensor(in_id_2), IsOkAndHolds(&in_tensor_2));
     ASSERT_THAT(ctx_2->Dispatch(), IsOk());
   }
+  // Destroy ctx_2 while it is the backend's last_ctx_ and verify ctx_1 can
+  // still bind and dispatch cleanly without use-after-free on last_ctx_.
+  ctx_2.reset();
+  ASSERT_THAT(ctx_1->BindSpatialTensor(in_id_1, &in_tensor_1), IsOk());
+  ASSERT_THAT(ctx_1->BindSpatialTensor(out_id_1, &out_tensor_1), IsOk());
+  ASSERT_THAT(ctx_1->Dispatch(), IsOk());
   ASSERT_THAT(backend_.WaitForCompletion(), IsOk());
 }
 

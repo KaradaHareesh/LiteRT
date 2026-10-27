@@ -92,7 +92,7 @@ struct BufferLocation {
 class CacheBuilder {
  public:
   CacheBuilder() = default;
-  ~CacheBuilder() = default;
+  ~CacheBuilder();
 
   // Non-copyable.
   CacheBuilder(const CacheBuilder&) = delete;
@@ -187,6 +187,9 @@ class CacheBuilder {
   // Temporary file descriptor to write the weights to disk immediately.
   FileDescriptor fd_;
   std::string file_path_;
+  std::string temp_file_path_;
+  bool temp_file_published_ = false;
+  bool is_initializing_ = false;
 };
 
 }  // namespace ml_drift

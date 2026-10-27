@@ -57,6 +57,7 @@
 
 namespace litert::ml_drift {
 
+class GpuInferenceContextWebGpu;
 class GpuIOBufferWebGpu;
 
 // GpuBackend for WebGPU.
@@ -193,12 +194,19 @@ class GpuBackendWebGpu : public GpuBackend {
         num_steps_of_command_buffer_preparations;
   }
 
+  GpuInferenceContextWebGpu* last_ctx() const { return last_ctx_; }
+  void set_last_ctx(GpuInferenceContextWebGpu* ctx) { last_ctx_ = ctx; }
+  // Joins any in-flight background command-buffer preparation thread on
+  // last_ctx_.
+  void JoinActiveCommandBuffersThread();
+
  private:
   std::unique_ptr<::ml_drift::webgpu::ExecutionEnvironment> env_owned_;
   ::ml_drift::webgpu::ExecutionEnvironment* const env_;
   absl::Mutex memory_manager_mutex_;
   ::ml_drift::webgpu::MemoryManager memory_manager_;
   int num_steps_of_command_buffer_preparations_ = 0;
+  GpuInferenceContextWebGpu* last_ctx_ = nullptr;
 
   // Encoder for batch of IO tensor conversions.
   std::unique_ptr<wgpu::CommandEncoder> command_encoder_;
@@ -264,6 +272,16 @@ class GpuInferenceContextWebGpu : public GpuInferenceContext {
 
   GpuBackendWebGpu* backend() const { return backend_; };
 
+  // Joins this context's background command-buffer preparation thread if
+  // running.
+  void JoinOwnCommandBuffersThread();
+  // Joins both backend_->last_ctx()'s and this context's background
+  // command-buffer preparation threads if running.
+  void JoinNextCommandBuffersThread();
+  // Joins any background command-buffer preparation thread and clears cached
+  // command buffers under backend_->memory_manager_mutex().
+  void InvalidateNextCommandBuffers();
+
  private:
   absl::StatusOr<::ml_drift::webgpu::SpatialTensor*> GetSpatialTensorInternal(
       ::ml_drift::ValueId id);
@@ -292,16 +310,6 @@ class GpuInferenceContextWebGpu : public GpuInferenceContext {
   // all next_command_buffers_ are prepared.
   bool next_command_buffers_ready_ = false;
   std::unique_ptr<std::thread> next_command_buffers_thread_;
-
-  // Static member var indicating the last context which built the command
-  // buffers. It's used to invalidate the next_command_buffers_ if it is not
-  // the same as the current context. For example, during multiple conversions
-  // with a LLM, prefill inference starts after decode and it would have command
-  // buffers prepared by the previous prefill inference which must be
-  // invalidated since the gpu resource binding would be changed.
-  // No synchronization is needed as the inference context is supposed to be
-  // running on a single thread.
-  static GpuInferenceContextWebGpu* last_ctx_;
 };
 
 class GpuTensorWrapperWebGpu : public GpuTensorWrapper {

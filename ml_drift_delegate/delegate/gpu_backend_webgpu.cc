@@ -199,7 +199,14 @@ absl::Status GpuBackendWebGpu::AssociateGpuEvent(
   return absl::UnimplementedError("AssociateGpuEvent is not implemented.");
 }
 
+void GpuBackendWebGpu::JoinActiveCommandBuffersThread() {
+  if (last_ctx_ != nullptr) {
+    last_ctx_->JoinOwnCommandBuffersThread();
+  }
+}
+
 absl::Status GpuBackendWebGpu::WaitForCompletion() {
+  JoinActiveCommandBuffersThread();
   return ::ml_drift::webgpu::WaitUntilCompleted(env_->queue(), env_->device(),
                                                 absl::Seconds(10));
 }
@@ -223,6 +230,7 @@ GpuBackendWebGpu::CreateInferenceContext(
     const ::ml_drift::CreateGpuModelInfo& create_info,
     ::ml_drift::GpuModel& gpu_model, std::vector<uint8_t>* serialized_model,
     bool may_share_memory_manager) {
+  JoinActiveCommandBuffersThread();
   auto ctx = std::make_unique<GpuInferenceContextWebGpu>(
       this, may_share_memory_manager ? &memory_manager_ : nullptr, create_info,
       num_steps_of_command_buffer_preparations_);
@@ -236,6 +244,7 @@ absl::StatusOr<std::unique_ptr<GpuInferenceContext>>
 GpuBackendWebGpu::RestoreInferenceContext(
     const ::ml_drift::CreateGpuModelInfo& create_info,
     const absl::Span<const uint8_t> serialized_model) {
+  JoinActiveCommandBuffersThread();
   auto ctx = std::make_unique<GpuInferenceContextWebGpu>(
       this, &memory_manager_, create_info,
       num_steps_of_command_buffer_preparations_);
@@ -307,6 +316,7 @@ GpuBackendWebGpu::CreateTensorWrapper(const ::ml_drift::TensorDescriptor& desc,
 
 absl::Status GpuBackendWebGpu::ReadSpatialTensorToDescriptor(
     ::ml_drift::GpuSpatialTensor& tensor, ::ml_drift::TensorDescriptor& desc) {
+  JoinActiveCommandBuffersThread();
   auto* wgpu_tensor = static_cast<::ml_drift::webgpu::SpatialTensor*>(&tensor);
   return wgpu_tensor->ToDescriptor(env_->device(), &desc);
 }
@@ -315,6 +325,7 @@ absl::Status GpuBackendWebGpu::UpdateSpatialTensor(
     ::ml_drift::GpuSpatialTensor* tensor,
     const ::ml_drift::TensorDescriptor& desc, size_t page_adjusted_offset,
     ReleaseDataCallback release_data_callback) {
+  JoinActiveCommandBuffersThread();
   // If there is any tensor memory, release it before we update the tensor.
   ABSL_RETURN_IF_ERROR(ReleaseSpatialTensorMemory(tensor));
 
@@ -346,6 +357,7 @@ absl::Status GpuBackendWebGpu::UpdateSpatialTensor(
 
 absl::Status GpuBackendWebGpu::ReleaseSpatialTensorMemory(
     ::ml_drift::GpuSpatialTensor* tensor) {
+  JoinActiveCommandBuffersThread();
   auto* wtensor = static_cast<::ml_drift::webgpu::SpatialTensor*>(tensor);
   wtensor->Release();
 #if !defined(__EMSCRIPTEN__)
@@ -418,13 +430,39 @@ GpuInferenceContextWebGpu::GpuInferenceContextWebGpu(
       num_nodes_per_command_encoder_(kNumNodesPerCommandEncoder) {}
 
 GpuInferenceContextWebGpu::~GpuInferenceContextWebGpu() {
+  InvalidateNextCommandBuffers();
+  if (backend_->last_ctx() == this) {
+    backend_->set_last_ctx(nullptr);
+  }
+}
+
+void GpuInferenceContextWebGpu::JoinOwnCommandBuffersThread() {
   if (next_command_buffers_thread_) {
-    next_command_buffers_thread_->join();
+    if (next_command_buffers_thread_->joinable()) {
+      next_command_buffers_thread_->join();
+    }
+    next_command_buffers_thread_.reset();
+  }
+}
+
+void GpuInferenceContextWebGpu::JoinNextCommandBuffersThread() {
+  backend_->JoinActiveCommandBuffersThread();
+  JoinOwnCommandBuffersThread();
+}
+
+void GpuInferenceContextWebGpu::InvalidateNextCommandBuffers() {
+  JoinOwnCommandBuffersThread();
+  next_command_buffers_index_ = 0;
+  next_command_buffers_ready_ = false;
+  absl::MutexLock lock(backend_->memory_manager_mutex());
+  for (auto& buffers : next_command_buffers_) {
+    buffers.clear();
   }
 }
 
 absl::StatusOr<::ml_drift::webgpu::SpatialTensor*>
 GpuInferenceContextWebGpu::GetSpatialTensorInternal(::ml_drift::ValueId id) {
+  JoinNextCommandBuffersThread();
   absl::MutexLock lock(backend_->memory_manager_mutex());
   auto* tensor = ctx_->GetTensor(id);
   if (tensor == nullptr) {
@@ -443,6 +481,7 @@ GpuInferenceContextWebGpu::GetSpatialTensor(::ml_drift::ValueId id) {
 
 absl::Status GpuInferenceContextWebGpu::BindSpatialTensor(
     ::ml_drift::ValueId id, ::ml_drift::GpuSpatialTensor* tensor) {
+  JoinNextCommandBuffersThread();
   absl::MutexLock lock(backend_->memory_manager_mutex());
   return ctx_->SetTensor(
       id, static_cast<::ml_drift::webgpu::SpatialTensor*>(tensor));
@@ -509,6 +548,7 @@ absl::Status GpuInferenceContextWebGpu::PrepareCommandBuffers(
     std::vector<wgpu::CommandBuffer>& command_buffers,
     bool submit_command_buffers) {
   absl::MutexLock lock(backend_->memory_manager_mutex());
+  command_buffers.clear();
   ABSL_ASSIGN_OR_RETURN(
       command_buffers,
       ctx_->CreateCommandBuffers(
@@ -517,29 +557,30 @@ absl::Status GpuInferenceContextWebGpu::PrepareCommandBuffers(
   return absl::OkStatus();
 }
 
-GpuInferenceContextWebGpu* GpuInferenceContextWebGpu::last_ctx_ = nullptr;
-
 absl::Status GpuInferenceContextWebGpu::PrepareCommandBuffersFromCached(
     std::vector<wgpu::CommandBuffer>& command_buffers) {
+  JoinNextCommandBuffersThread();
+
   if (next_command_buffers_.empty()) {
+    if (backend_->last_ctx() != this) {
+      if (backend_->last_ctx() != nullptr) {
+        backend_->last_ctx()->InvalidateNextCommandBuffers();
+      }
+      backend_->set_last_ctx(this);
+    }
     return PrepareCommandBuffers(command_buffers,
                                  /*submit_command_buffers=*/true);
   }
 
-  if (next_command_buffers_thread_) {
-    next_command_buffers_thread_->join();
-  }
-
-  if (last_ctx_ != this) {
-    last_ctx_ = this;
+  if (backend_->last_ctx() != this) {
+    if (backend_->last_ctx() != nullptr) {
+      backend_->last_ctx()->InvalidateNextCommandBuffers();
+    }
     // The next_command_buffers_ must be invalidated since the last Dispatch()
     // call was done by a different context. next_command_buffers_ is valid only
     // when Dispatch() is called by the same context continuously.
-    next_command_buffers_index_ = 0;
-    next_command_buffers_ready_ = false;
-    for (auto& buffers : next_command_buffers_) {
-      buffers.clear();
-    }
+    InvalidateNextCommandBuffers();
+    backend_->set_last_ctx(this);
   }
 
   if (next_command_buffers_ready_) {
@@ -551,6 +592,18 @@ absl::Status GpuInferenceContextWebGpu::PrepareCommandBuffersFromCached(
     ABSL_RETURN_IF_ERROR(
         PrepareCommandBuffers(command_buffers,
                               /*submit_command_buffers=*/true));
+  }
+
+  // Submit and release any ready command buffers before spawning the
+  // background preparation thread so Dawn's Queue::Submit() and
+  // CommandBuffer destruction do not race with background command encoding.
+  if (!command_buffers.empty()) {
+    absl::MutexLock lock(backend_->memory_manager_mutex());
+    for (size_t i = 0; i < command_buffers.size(); ++i) {
+      // Submit every buffer separately to avoid hangs
+      backend_->wgpu_env().queue().Submit(1, &command_buffers[i]);
+    }
+    command_buffers.clear();
   }
 
 #ifndef __EMSCRIPTEN__
@@ -588,9 +641,13 @@ absl::Status GpuInferenceContextWebGpu::Dispatch() {
   std::vector<wgpu::CommandBuffer> command_buffers;
   ABSL_RETURN_IF_ERROR(PrepareCommandBuffersFromCached(command_buffers));
 
-  for (int i = 0; i < command_buffers.size(); ++i) {
-    // Submit every buffer separately to avoid hangs
-    backend_->wgpu_env().queue().Submit(1, &command_buffers[i]);
+  if (!command_buffers.empty()) {
+    absl::MutexLock lock(backend_->memory_manager_mutex());
+    for (size_t i = 0; i < command_buffers.size(); ++i) {
+      // Submit every buffer separately to avoid hangs
+      backend_->wgpu_env().queue().Submit(1, &command_buffers[i]);
+    }
+    command_buffers.clear();
   }
   return absl::OkStatus();
 }
@@ -611,6 +668,7 @@ absl::Status GpuInferenceContextWebGpu::WaitForEventsCompleted(
 }
 
 absl::Status GpuInferenceContextWebGpu::PreConvert(bool input) {
+  JoinNextCommandBuffersThread();
   backend_->set_command_encoder(std::make_unique<wgpu::CommandEncoder>(
       backend_->wgpu_env().device().CreateCommandEncoder()));
   backend_->set_compute_pass_encoder(std::make_unique<wgpu::ComputePassEncoder>(
@@ -619,6 +677,7 @@ absl::Status GpuInferenceContextWebGpu::PreConvert(bool input) {
 }
 
 absl::Status GpuInferenceContextWebGpu::PostConvert(bool input) {
+  JoinNextCommandBuffersThread();
   backend_->compute_pass_encoder()->End();
   backend_->set_compute_pass_encoder(nullptr);
 
@@ -637,6 +696,7 @@ absl::Status GpuInferenceContextWebGpu::PostConvert(bool input) {
 
 absl::Status GpuInferenceContextWebGpu::Profile(
     ::ml_drift::ProfilingInfo& profiling_info) {
+  JoinNextCommandBuffersThread();
   return ctx_->Profile(backend_->wgpu_env(), &profiling_info);
 }
 
@@ -669,6 +729,7 @@ absl::Status GpuInferenceContextWebGpu::ReportMemoryBenchmarkIfEnabled(
 
 absl::Status GpuInferenceContextWebGpu::SetCommandBufferHint(
     int num_nodes_per_command_encoder) {
+  JoinNextCommandBuffersThread();
   num_nodes_per_command_encoder_ = num_nodes_per_command_encoder;
   return absl::OkStatus();
 }
@@ -693,6 +754,7 @@ GpuIOBufferWebGpu::~GpuIOBufferWebGpu() {
 }
 
 absl::Status GpuIOBufferWebGpu::Read(absl::Span<uint8_t> data) {
+  backend_->JoinActiveCommandBuffersThread();
   if (mappable_buffer_ == nullptr) {
     return absl::InvalidArgumentError("Buffer is not for read.");
   }
@@ -702,6 +764,7 @@ absl::Status GpuIOBufferWebGpu::Read(absl::Span<uint8_t> data) {
 }
 
 absl::Status GpuIOBufferWebGpu::Write(absl::Span<const uint8_t> data) {
+  backend_->JoinActiveCommandBuffersThread();
   ::ml_drift::webgpu::WriteDataToBuffer(backend_->wgpu_env().queue(),
                                         buffer_.GetMemoryHandle(), data.size(),
                                         data.data());

@@ -159,5 +159,31 @@ TEST_F(SimpleCacheTest, OverwriteData) {
   }
 }
 
+TEST_F(SimpleCacheTest, OverwriteDoesNotMutateActiveMappedReader) {
+  std::vector<uint8_t> data1(8192, 0xAB);
+  std::vector<uint8_t> data2(128, 0xCD);
+
+  SimpleCache writer1(cache_file_path_);
+  ABSL_EXPECT_OK(writer1.Store(data1));
+
+  ::ml_drift::MMapHandle retained_mmap;
+  SimpleCache reader(cache_file_path_);
+  ABSL_EXPECT_OK(reader.Load([&](absl::Span<const uint8_t> loaded_data,
+                                 ::ml_drift::MMapHandle& mmap_handle) {
+    EXPECT_EQ(loaded_data, data1);
+    retained_mmap = std::move(mmap_handle);
+    return absl::OkStatus();
+  }));
+
+  SimpleCache writer2(cache_file_path_);
+  ABSL_EXPECT_OK(writer2.Store(data2));
+
+  // The retained mmap handle from the first load must still see the intact
+  // original bytes rather than being truncated or overwritten in-place.
+  absl::Span<const uint8_t> retained_span(retained_mmap.data(),
+                                          retained_mmap.size());
+  EXPECT_EQ(retained_span, data1);
+}
+
 }  // namespace
 }  // namespace litert::ml_drift

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <utility>
@@ -125,7 +126,7 @@ class GpuAccelerator {
                                      LiteRtAcceleratorConst accelerator,
                                      LiteRtOptions options,
                                      LiteRtDelegateWrapper* delegate_wrapper) {
-    active_env_ = env;
+    active_env_.store(env, std::memory_order_relaxed);
     litert::TfLiteDelegatePtr delegate_ptr{nullptr, nullptr};
     LITERT_RETURN_IF_ERROR(CreateGpuDelegateImpl(
         runtime_context, env, accelerator, options, delegate_ptr));
@@ -163,8 +164,8 @@ class GpuAccelerator {
                                       HwMemoryInfoPtr* hw_memory_info);
 
  private:
-  static LiteRtGpuBackend active_backend_;
-  static LiteRtEnvironment active_env_;
+  static std::atomic<LiteRtGpuBackend> active_backend_;
+  static std::atomic<LiteRtEnvironment> active_env_;
 
   static LiteRtStatus CreateGpuDelegateImpl(
       LiteRtRuntimeContext* runtime_context, LiteRtEnvironment env,
@@ -184,7 +185,7 @@ class GpuAccelerator {
       }
     }
     if (backend == kLiteRtGpuBackendWebGpu) {
-      active_backend_ = kLiteRtGpuBackendWebGpu;
+      active_backend_.store(kLiteRtGpuBackendWebGpu, std::memory_order_relaxed);
       auto delegate_options =
           litert::ml_drift::MlDriftWebGpuDelegateDefaultOptionsPtr();
       if (delegate_options && options) {
@@ -200,7 +201,7 @@ class GpuAccelerator {
           litert::ml_drift::CreateMlDriftWebGpuDelegate, delegate_ptr);
     }
 #endif  // LITERT_HAS_WEBGPU_SUPPORT
-    active_backend_ = kLiteRtGpuBackendOpenCl;
+    active_backend_.store(kLiteRtGpuBackendOpenCl, std::memory_order_relaxed);
     auto delegate_options =
         litert::ml_drift::MlDriftClDelegateDefaultOptionsPtr();
     if (delegate_options && options) {
@@ -219,8 +220,9 @@ class GpuAccelerator {
   LiteRtHwAcceleratorSet hardware_support_;
 };
 
-LiteRtGpuBackend GpuAccelerator::active_backend_ = kLiteRtGpuBackendAutomatic;
-LiteRtEnvironment GpuAccelerator::active_env_ = nullptr;
+std::atomic<LiteRtGpuBackend> GpuAccelerator::active_backend_{
+    kLiteRtGpuBackendAutomatic};
+std::atomic<LiteRtEnvironment> GpuAccelerator::active_env_{nullptr};
 
 LiteRtStatus GpuAccelerator::CreateGpuMemory(
     LiteRtGpuDeviceId device_id, LiteRtGpuQueueId queue_id,
@@ -228,15 +230,18 @@ LiteRtStatus GpuAccelerator::CreateGpuMemory(
     LiteRtTensorBufferType buffer_type, size_t bytes, size_t packed_bytes,
     HwMemoryInfoPtr* hw_memory_info) {
   auto wrapper = std::make_unique<HybridMemoryInfo>();
-  wrapper->backend = active_backend_;
+  const LiteRtGpuBackend backend =
+      active_backend_.load(std::memory_order_relaxed);
+  wrapper->backend = backend;
 
   LiteRtStatus status;
-  if (active_backend_ == kLiteRtGpuBackendWebGpu) {
+  if (backend == kLiteRtGpuBackendWebGpu) {
     status =
         LiteRtCreateWebGpuMemory(device_id, queue_id, tensor_type, buffer_type,
                                  bytes, packed_bytes, &wrapper->real_info);
   } else {
-    ResolveOpenClResources(active_env_, device_id, queue_id);
+    ResolveOpenClResources(active_env_.load(std::memory_order_relaxed),
+                           device_id, queue_id);
     status =
         LiteRtCreateOpenClMemory(device_id, queue_id, tensor_type, buffer_type,
                                  bytes, packed_bytes, &wrapper->real_info);
@@ -296,15 +301,18 @@ LiteRtStatus GpuAccelerator::ImportGpuMemory(
     LiteRtTensorBufferType buffer_type, HwMemoryHandle hw_buffer_handle,
     size_t bytes, size_t packed_bytes, HwMemoryInfoPtr* hw_memory_info) {
   auto wrapper = std::make_unique<HybridMemoryInfo>();
-  wrapper->backend = active_backend_;
+  const LiteRtGpuBackend backend =
+      active_backend_.load(std::memory_order_relaxed);
+  wrapper->backend = backend;
 
   LiteRtStatus status;
-  if (active_backend_ == kLiteRtGpuBackendWebGpu) {
+  if (backend == kLiteRtGpuBackendWebGpu) {
     status = LiteRtImportWebGpuMemory(device_id, queue_id, tensor_type,
                                       buffer_type, hw_buffer_handle, bytes,
                                       packed_bytes, &wrapper->real_info);
   } else {
-    ResolveOpenClResources(active_env_, device_id, queue_id);
+    ResolveOpenClResources(active_env_.load(std::memory_order_relaxed),
+                           device_id, queue_id);
     status = LiteRtImportOpenClMemory(device_id, queue_id, tensor_type,
                                       buffer_type, hw_buffer_handle, bytes,
                                       packed_bytes, &wrapper->real_info);
