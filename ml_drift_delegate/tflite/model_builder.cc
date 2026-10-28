@@ -3148,6 +3148,12 @@ class EmbeddingLookupOperationParser : public TFLiteOperationParser {
     } else if (weights_tensor->type != kTfLiteFloat32) {
       return absl::InvalidArgumentError(
           "EMBEDDING_LOOKUP: Unsupported weights type.");
+    } else if (!tflite::IsConstantTensor(weights_tensor)) {
+      // Parse() copies float32 weights into the operation attributes while the
+      // graph is built. Weights computed at runtime (e.g. by a DEQUANTIZE) have
+      // no data at that point.
+      return absl::InvalidArgumentError(
+          "EMBEDDING_LOOKUP: Float32 weights must be a constant tensor.");
     }
     ABSL_RETURN_IF_ERROR(PreCheckReadValue(context, node, 0));
 
