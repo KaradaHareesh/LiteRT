@@ -17,11 +17,13 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "litert/c/litert_common.h"
 #include "litert/c/litert_custom_op_kernel.h"
+#include "litert/c/litert_op_resolver.h"
 #include "litert/cc/internal/scoped_weight_source.h"
 
 namespace weight_loader {
@@ -58,19 +60,32 @@ struct LiteRtOptionsT {
     LiteRtCustomOpKernel op_kernel;
   };
 
-  // This should be updated every time a field is added/edited.
+  // Schema version of compilation options, used by CompilationCache as part of
+  // the cache key fingerprint (see compilation_cache.cc).
   //
+  // LiteRtOptionsT is an internal C++ struct represented as an opaque handle in
+  // public C APIs, so new fields do not need to be appended at the end and may
+  // be grouped logically.
+  //
+  // This should be updated every time a field is added/edited:
   // - Renaming a field: increment patch;
   // - Adding or deprecating a field: set patch to 0, increment minor.
-  // - Breaking layout compatibility: set patch and minor to 0, increment major.
+  // - Breaking layout compatibility or invalidating cached compiled models:
+  //   set patch and minor to 0, increment major.
   //
-  // Note: Changing a default value does not impact the version.
-  LiteRtApiVersion version = {.major = 1, .minor = 0, .patch = 0};
+  // Note: Only changes to version.major invalidate the CompilationCache;
+  // minor updates do not impact cache keys. Changing a default value does not
+  // impact the version.
+  LiteRtApiVersion version = {.major = 1, .minor = 1, .patch = 0};
   LiteRtHwAcceleratorSet hardware_accelerators = kLiteRtHwAcceleratorNone;
   LiteRtOpaqueOptions options = nullptr;
   std::vector<CustomOpOption> custom_op_options;
   std::vector<const TfLiteRegistration*> custom_tflite_op_registrations;
   std::vector<const TfLiteOperator*> custom_tflite_op_operators;
+  // Optional C API representation of an application-provided TFLite OpResolver.
+  // When set, CompiledModel wraps these callbacks into an OpResolver instead of
+  // creating the default builtin op resolver.
+  std::optional<LiteRtOpResolverCApi> op_resolver_c_api;
   // Optional non-owning pointer to an application-provided TFLite
   // MutableOpResolver. When set, CompiledModel copies its registrations into
   // the runtime's op resolver instead of creating the default builtin op
