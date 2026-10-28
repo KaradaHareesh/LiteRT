@@ -359,6 +359,99 @@ private constructor(
     }
   }
 
+  /**
+   * Options to configure the LiteRT compiler plugin when compiling a model.
+   *
+   * Input shape overrides refine dynamic input dimensions before on-device (JIT) compilation. For
+   * each signature, use exactly one addressing mode (positional, tensor name, or signature input
+   * name); for the named modes, the last override for a given name wins. Each dimension must be
+   * positive, or `-1` to keep it dynamic.
+   *
+   * Note: Overrides are applied only during on-device (JIT) compilation by a compiler plugin, which
+   * requires a compiler plugin library directory in the [Environment] and a model that is not
+   * pre-compiled. Otherwise (e.g. CPU-only execution), they are ignored. Names and signature keys
+   * are validated when [CompiledModel.create] is called; dimensions and addressing modes are only
+   * validated during compilation.
+   *
+   * The overrides are copied when [CompiledModel.create] is called, so modifying this object
+   * afterwards does not affect already created models.
+   */
+  class CompilerOptions {
+    internal enum class InputShapeMode constructor(val value: Int) {
+      POSITIONAL(0),
+      TENSOR(1),
+      SIGNATURE(2),
+    }
+
+    internal class InputShapeOverride(
+      val mode: InputShapeMode,
+      val signature: String,
+      val name: String,
+      val dimensions: IntArray,
+    )
+
+    internal val inputShapeOverrides = mutableListOf<InputShapeOverride>()
+
+    /**
+     * Appends a positional input shape override for [signature]. Call once per input, in subgraph
+     * input order.
+     *
+     * @param dimensions Target dimensions for the input (use `intArrayOf()` for a 0-D scalar, or
+     *   `-1` for dimensions that should remain dynamic).
+     * @param signature Target signature key, or `""` for the default signature.
+     * @return This [CompilerOptions] instance for chaining.
+     */
+    @JvmOverloads
+    fun addPositionalInputShape(dimensions: IntArray, signature: String = ""): CompilerOptions {
+      inputShapeOverrides.add(
+        InputShapeOverride(InputShapeMode.POSITIONAL, signature, "", dimensions.clone())
+      )
+      return this
+    }
+
+    /**
+     * Appends an input shape override addressed by internal tensor name in [signature]'s subgraph.
+     *
+     * @param tensorName Internal graph tensor name of the subgraph input.
+     * @param dimensions Target dimensions for the input (use `intArrayOf()` for a 0-D scalar, or
+     *   `-1` for dimensions that should remain dynamic).
+     * @param signature Target signature key, or `""` for the default signature.
+     * @return This [CompilerOptions] instance for chaining.
+     */
+    @JvmOverloads
+    fun addTensorInputShape(
+      tensorName: String,
+      dimensions: IntArray,
+      signature: String = "",
+    ): CompilerOptions {
+      inputShapeOverrides.add(
+        InputShapeOverride(InputShapeMode.TENSOR, signature, tensorName, dimensions.clone())
+      )
+      return this
+    }
+
+    /**
+     * Appends an input shape override addressed by signature input name in [signature].
+     *
+     * @param inputName Signature input argument name.
+     * @param dimensions Target dimensions for the input (use `intArrayOf()` for a 0-D scalar, or
+     *   `-1` for dimensions that should remain dynamic).
+     * @param signature Target signature key, or `""` for the default signature.
+     * @return This [CompilerOptions] instance for chaining.
+     */
+    @JvmOverloads
+    fun addSignatureInputShape(
+      inputName: String,
+      dimensions: IntArray,
+      signature: String = "",
+    ): CompilerOptions {
+      inputShapeOverrides.add(
+        InputShapeOverride(InputShapeMode.SIGNATURE, signature, inputName, dimensions.clone())
+      )
+      return this
+    }
+  }
+
   /** Options to specify hardware acceleration for compiling a model. */
   class Options constructor(private val accelerators: Set<Accelerator>) {
 
@@ -369,6 +462,7 @@ private constructor(
     var cpuOptions: CpuOptions? = null
     var gpuOptions: GpuOptions? = null
     var qualcommOptions: QualcommOptions? = null
+    var compilerOptions: CompilerOptions? = null
 
     /**
      * Disables automatically fall back to CPU when the accelerator is not available. The default is
@@ -458,11 +552,7 @@ private constructor(
 
   @Throws(LiteRtException::class)
   @JvmOverloads
-  fun resizeInputTensor(
-    inputName: String,
-    dimensions: IntArray,
-    signature: String = "",
-  ) {
+  fun resizeInputTensor(inputName: String, dimensions: IntArray, signature: String = "") {
     assertNotDestroyed()
 
     nativeResizeInputTensor(handle, signature, inputName, dimensions)
@@ -470,11 +560,7 @@ private constructor(
 
   @Throws(LiteRtException::class)
   @JvmOverloads
-  fun resizeInputTensorNonStrict(
-    inputName: String,
-    dimensions: IntArray,
-    signature: String = "",
-  ) {
+  fun resizeInputTensorNonStrict(inputName: String, dimensions: IntArray, signature: String = "") {
     assertNotDestroyed()
 
     nativeResizeInputTensorNonStrict(handle, signature, inputName, dimensions)
@@ -613,6 +699,8 @@ private constructor(
       val cpuOptionsMap = options.cpuOptions?.toMap() ?: mapOf()
       val gpuOptionsMap = options.gpuOptions?.toMap() ?: mapOf()
       val qualcommOptionsMap = options.qualcommOptions?.toMap() ?: mapOf()
+      val inputShapeOverrides =
+        options.compilerOptions?.inputShapeOverrides?.toList() ?: emptyList()
       return CompiledModel(
         nativeCreateFromAsset(
           env.handle,
@@ -625,6 +713,10 @@ private constructor(
           gpuOptionsMap.values.toTypedArray(),
           qualcommOptionsMap.keys.map { it.value }.toIntArray(),
           qualcommOptionsMap.values.toTypedArray(),
+          inputShapeOverrides.map { it.mode.value }.toIntArray(),
+          inputShapeOverrides.map { it.signature }.toTypedArray(),
+          inputShapeOverrides.map { it.name }.toTypedArray(),
+          inputShapeOverrides.map { it.dimensions }.toTypedArray(),
         ),
         env,
         envManaged,
@@ -643,6 +735,8 @@ private constructor(
       val cpuOptionsMap = options.cpuOptions?.toMap() ?: mapOf()
       val gpuOptionsMap = options.gpuOptions?.toMap() ?: mapOf()
       val qualcommOptionsMap = options.qualcommOptions?.toMap() ?: mapOf()
+      val inputShapeOverrides =
+        options.compilerOptions?.inputShapeOverrides?.toList() ?: emptyList()
       return CompiledModel(
         nativeCreateFromFile(
           env.handle,
@@ -654,6 +748,10 @@ private constructor(
           gpuOptionsMap.values.toTypedArray(),
           qualcommOptionsMap.keys.map { it.value }.toIntArray(),
           qualcommOptionsMap.values.toTypedArray(),
+          inputShapeOverrides.map { it.mode.value }.toIntArray(),
+          inputShapeOverrides.map { it.signature }.toTypedArray(),
+          inputShapeOverrides.map { it.name }.toTypedArray(),
+          inputShapeOverrides.map { it.dimensions }.toTypedArray(),
         ),
         env,
         envManaged,
@@ -695,6 +793,10 @@ private constructor(
       gpuOptionsValues: Array<String>,
       qualcommOptionsKeys: IntArray,
       qualcommOptionsValues: Array<String>,
+      inputShapeModes: IntArray,
+      inputShapeSignatures: Array<String>,
+      inputShapeNames: Array<String>,
+      inputShapeDimensions: Array<IntArray>,
     ): Long
 
     @JvmStatic
@@ -708,6 +810,10 @@ private constructor(
       gpuOptionsValues: Array<String>,
       qualcommOptionsKeys: IntArray,
       qualcommOptionsValues: Array<String>,
+      inputShapeModes: IntArray,
+      inputShapeSignatures: Array<String>,
+      inputShapeNames: Array<String>,
+      inputShapeDimensions: Array<IntArray>,
     ): Long
 
     @JvmStatic
